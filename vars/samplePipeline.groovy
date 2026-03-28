@@ -43,6 +43,7 @@ def call(Map configMap){
                     }
                 }
             }
+        }
     // Post-Build
         post { 
             always { 
