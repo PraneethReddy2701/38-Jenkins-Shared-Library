@@ -1,0 +1,190 @@
+def call(Map configMap){
+    pipeline{
+        // agent any
+        agent {
+            node {
+                label 'AGENT-1'
+            }
+        }
+        // Pre-Build
+        environment{
+            appVersion = ''
+            REGION = "us-east-1"
+            ACC_ID = "235270182665"
+            PROJECT = configMap.get('project')
+            COMPONENT = configMap.get('component')
+        }
+        options {
+            timeout(time: 30, unit: 'MINUTES')
+            disableConcurrentBuilds()
+        }
+        parameters {
+            booleanParam(name: 'deploy', defaultValue: false, description: 'Toggle this value')
+        }
+    
+    // Build
+        stages{
+            stage('Read pom.xml'){
+                steps{
+                    script{
+                        appVersion = readMavenPom().getVersion()
+                        echo "The package version is: ${appVersion}"
+                        
+                    }
+                }
+            }
+            stage('Install Dependencies'){
+                steps{
+                    script{
+                        sh """
+                            mvn clean package
+                        """
+                    }
+                }
+            }
+            stage('Unit Testing'){
+                steps{
+                    script{
+                        sh """
+                            echo 'unit testing'
+                        """
+                    }
+                }
+            }
+    /*         stage('Sonar Scan'){
+                environment{
+                    scannerHome = tool 'sonar-8.0'
+                }
+                steps{
+                    // sonar server environment
+                    withSonarQubeEnv('sonar-8.0') { 
+                        sh "${scannerHome}/bin/sonar-scanner"
+                    }
+                }
+            }
+            
+            // Enable webhook in sonarqube server and wait for sonarscanner to send the results to jenkins
+            stage('Quality Gate') {
+                steps {
+                    timeout(time: 1, unit: 'HOURS') { // Optional: adds a timeout to prevent indefinite waiting
+                        waitForQualityGate abortPipeline: true 
+                    }
+                }
+            } */
+            stage('Check Dependabot Alerts') {
+                environment { 
+                    GITHUB_TOKEN = credentials('github-token')
+                }
+                steps {
+                    script {
+                        // Fetch alerts from GitHub
+                        def response = sh(
+                            script: """
+                                curl -s -H "Accept: application/vnd.github+json" \
+                                    -H "Authorization: token ${GITHUB_TOKEN}" \
+                                    https://api.github.com/repos/PraneethReddy2701/36-catalogue/dependabot/alerts
+                            """,
+                            returnStdout: true
+                        ).trim()
+
+                        // Parse JSON
+                        def json = readJSON text: response
+
+                        // Filter alerts by severity
+                        def criticalOrHigh = json.findAll { alert ->
+                            def severity = alert?.security_advisory?.severity?.toLowerCase()
+                            def state = alert?.state?.toLowerCase()
+                            return (state == "open" && (severity == "critical" || severity == "high"))
+                        }
+
+                        if (criticalOrHigh.size() > 0) {
+                            error "❌ Found ${criticalOrHigh.size()} HIGH/CRITICAL Dependabot alerts. Failing pipeline!"
+                        } else {
+                            echo "✅ No HIGH/CRITICAL Dependabot alerts found."
+                        }
+                    }
+                }
+            }
+            stage('Docker Build'){
+                steps{
+                    script{
+                        withAWS(credentials: 'aws-creds', region: 'us-east-1') {
+                            sh """
+                                aws ecr get-login-password --region ${REGION} | docker login --username AWS --password-stdin ${ACC_ID}.dkr.ecr.us-east-1.amazonaws.com
+                                docker build -t ${ACC_ID}.dkr.ecr.us-east-1.amazonaws.com/${PROJECT}/${COMPONENT}:${appVersion} .
+                                docker push ${ACC_ID}.dkr.ecr.us-east-1.amazonaws.com/${PROJECT}/${COMPONENT}:${appVersion}
+                            """
+                        }
+                    }
+                }
+            }
+/*             stage('Check Scan Results') {
+                steps {
+                    script {
+                        withAWS(credentials: 'aws-creds', region: 'us-east-1') {
+                        // Fetch scan findings
+                            def findings = sh(
+                                script: """
+                                    aws ecr describe-image-scan-findings \
+                                    --repository-name ${PROJECT}/${COMPONENT} \
+                                    --image-id imageTag=${appVersion} \
+                                    --region ${REGION} \
+                                    --output json
+                                """,
+                                returnStdout: true
+                            ).trim()
+
+                            // Parse JSON
+                            def json = readJSON text: findings
+
+                            def highCritical = json.imageScanFindings.findings.findAll {
+                                it.severity == "HIGH" || it.severity == "CRITICAL"
+                            }
+
+                            if (highCritical.size() > 0) {
+                                echo "❌ Found ${highCritical.size()} HIGH/CRITICAL vulnerabilities!"
+                                currentBuild.result = 'FAILURE'
+                                error("Build failed due to vulnerabilities")
+                            } else {
+                                echo "✅ No HIGH/CRITICAL vulnerabilities found."
+                            }
+                        }
+                    }
+                }
+            } */
+            stage('Trigger Deploy'){
+                when {
+                    expression {
+                        params.deploy // Access the parameter value via params.CHOICE
+                    }
+                }
+                steps{
+                    script{
+                        build job: "../${COMPONENT}-cd",
+                        parameters: [
+                            string(name: 'appVersion', value: "${appVersion}"),
+                            string(name: 'deploy_to', value: 'dev')
+                            //string(name: 'imageURL', value: "${imageURL}"),
+                        ],
+                        propagate: false,   // even if SG fails, VPC will not fail
+                        wait: false         // VPC doesnot wait for the SG pipeline to complete
+                    }
+                }
+            }
+        }
+
+    // Post-Build
+        post { 
+            always { 
+                echo 'I will always say Hello pipeline!'
+                deleteDir()
+            }
+            success { 
+                echo 'Hello pipeline is success!'
+            }
+            failure { 
+                echo 'Hello pipeline is failure!'
+            }
+        }
+    }
+}
